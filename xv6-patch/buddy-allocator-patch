@@ -1,0 +1,210 @@
+diff --git a/kernel/buddy.c b/kernel/buddy.c
+index 1374797..6f6c98d 100644
+--- a/kernel/buddy.c
++++ b/kernel/buddy.c
+@@ -27,7 +27,7 @@ typedef struct list Bd_list;
+ // 8 blocks).
+ struct sz_info {
+   Bd_list free;
+-  char *alloc;
++  char *extra;
+   char *split;
+ };
+ typedef struct sz_info Sz_info;
+@@ -57,6 +57,13 @@ void bit_clear(char *array, int index) {
+   array[index / 8] = (b & ~m);
+ }
+ 
++// Invert a bit at position index in array
++void bit_invert(char *array, int index) {
++  char b = array[index / 8];
++  char m = (1 << (index % 8));
++  array[index / 8] = (b ^ m);
++}
++
+ // Print a bit vector as a list of ranges of 1 bits
+ void bd_print_vector(char *vector, int len) {
+   int last, lb;
+@@ -80,8 +87,8 @@ void bd_print() {
+   for (int k = 0; k < nsizes; k++) {
+     printf("size %d (blksz %d nblk %d): free list: ", k, BLK_SIZE(k), NBLK(k));
+     lst_print(&bd_sizes[k].free);
+-    printf("  alloc:");
+-    bd_print_vector(bd_sizes[k].alloc, NBLK(k));
++    printf("  extra:");
++    bd_print_vector(bd_sizes[k].extra, ROUNDUP(NBLK(k), 2) / 2);
+     if (k > 0) {
+       printf("  split:");
+       bd_print_vector(bd_sizes[k].split, NBLK(k));
+@@ -131,13 +138,13 @@ void *bd_malloc(uint64 nbytes) {
+ 
+   // Found a block; pop it and potentially split it.
+   char *p = lst_pop(&bd_sizes[k].free);
+-  bit_set(bd_sizes[k].alloc, blk_index(k, p));
++  bit_invert(bd_sizes[k].extra, blk_index(k, p) / 2);
+   for (; k > fk; k--) {
+     // split a block at size k and mark one half allocated at size k-1
+     // and put the buddy on the free list at size k-1
+     char *q = p + BLK_SIZE(k - 1);  // p's buddy
+     bit_set(bd_sizes[k].split, blk_index(k, p));
+-    bit_set(bd_sizes[k - 1].alloc, blk_index(k - 1, p));
++    bit_invert(bd_sizes[k - 1].extra, blk_index(k - 1, p) / 2);
+     lst_push(&bd_sizes[k - 1].free, q);
+   }
+   release(&lock);
+@@ -165,9 +172,9 @@ void bd_free(void *p) {
+   for (k = size(p); k < MAXSIZE; k++) {
+     int bi = blk_index(k, p);
+     int buddy = (bi % 2 == 0) ? bi + 1 : bi - 1;
+-    bit_clear(bd_sizes[k].alloc, bi);           // free p at size k
+-    if (bit_isset(bd_sizes[k].alloc, buddy)) {  // is buddy allocated?
+-      break;                                    // break out of loop
++    bit_invert(bd_sizes[k].extra, bi / 2);       // free p at size k
++    if (bit_isset(bd_sizes[k].extra, bi / 2)) {  // is buddy allocated?
++      break;                                     // break out of loop
+     }
+     // budy is free; merge with buddy
+     q = addr(k, buddy);
+@@ -214,7 +221,7 @@ void bd_mark(void *start, void *stop) {
+         // if a block is allocated at size k, mark it as split too.
+         bit_set(bd_sizes[k].split, bi);
+       }
+-      bit_set(bd_sizes[k].alloc, bi);
++      bit_invert(bd_sizes[k].extra, bi / 2);
+     }
+   }
+ }
+@@ -224,10 +231,10 @@ void bd_mark(void *start, void *stop) {
+ int bd_initfree_pair(int k, int bi) {
+   int buddy = (bi % 2 == 0) ? bi + 1 : bi - 1;
+   int free = 0;
+-  if (bit_isset(bd_sizes[k].alloc, bi) != bit_isset(bd_sizes[k].alloc, buddy)) {
++  if (bit_isset(bd_sizes[k].extra, bi / 2)) {
+     // one of the pair is free
+     free = BLK_SIZE(k);
+-    if (bit_isset(bd_sizes[k].alloc, bi))
++    if (bit_isset(bd_sizes[k].split, bi))
+       lst_push(&bd_sizes[k].free, addr(k, buddy));  // put buddy on free list
+     else
+       lst_push(&bd_sizes[k].free, addr(k, bi));  // put bi on free list
+@@ -297,8 +304,9 @@ void bd_init(void *base, void *end) {
+   for (int k = 0; k < nsizes; k++) {
+     lst_init(&bd_sizes[k].free);
+     sz = sizeof(char) * ROUNDUP(NBLK(k), 8) / 8;
+-    bd_sizes[k].alloc = p;
+-    memset(bd_sizes[k].alloc, 0, sz);
++    sz = ROUNDUP(sz, 2) / 2;
++    bd_sizes[k].extra = p;
++    memset(bd_sizes[k].extra, 0, sz);
+     p += sz;
+   }
+ 
+@@ -310,6 +318,7 @@ void bd_init(void *base, void *end) {
+     memset(bd_sizes[k].split, 0, sz);
+     p += sz;
+   }
++
+   p = (char *)ROUNDUP((uint64)p, LEAF_SIZE);
+ 
+   // done allocating; mark the memory range [base, p) as allocated, so
+diff --git a/kernel/file.c b/kernel/file.c
+index 6aafecb..896581f 100644
+--- a/kernel/file.c
++++ b/kernel/file.c
+@@ -14,52 +14,45 @@
+ #include "proc.h"
+ 
+ struct devsw devsw[NDEV];
+-struct {
+-  struct spinlock lock;
+-} ftable;
+ 
+-void fileinit(void) { initlock(&ftable.lock, "ftable"); }
++void fileinit(void) {}
+ 
+ // Allocate a file structure.
+ struct file *filealloc(void) {
+   // ftable.lock is not required since buddy allocator has a lock inside
+   struct file *f = (struct file *)bd_malloc(sizeof(struct file));
+-  if (f != 0) {
+-    f->ref = 1;
+-  }
++  initlock(&f->lock, "file lock");
++  f->ref = 1;
+   return f;
+ }
+ 
+ // Increment ref count for file f.
+ struct file *filedup(struct file *f) {
+-  acquire(&ftable.lock);
++  acquire(&f->lock);
+   if (f->ref < 1) panic("filedup");
+   f->ref++;
+-  release(&ftable.lock);
++  release(&f->lock);
+   return f;
+ }
+ 
+ // Close file f.  (Decrement ref count, close when reaches 0.)
+ void fileclose(struct file *f) {
+-  struct file ff;
+-
+-  acquire(&ftable.lock);  // Lock is required here. Maybe add f.lock?
++  acquire(&f->lock);  // Lock is required here. Maybe add f.lock?
+   if (f->ref < 1) panic("fileclose");
+   if (--f->ref > 0) {
+-    release(&ftable.lock);
++    release(&f->lock);
+     return;
+   }
+-  ff = *f;
+-  bd_free(f);
+-  release(&ftable.lock);
++  release(&f->lock);
+ 
+-  if (ff.type == FD_PIPE) {
+-    pipeclose(ff.pipe, ff.writable);
+-  } else if (ff.type == FD_INODE || ff.type == FD_DEVICE) {
++  if (f->type == FD_PIPE) {
++    pipeclose(f->pipe, f->writable);
++  } else if (f->type == FD_INODE || f->type == FD_DEVICE) {
+     begin_op();
+-    iput(ff.ip);
++    iput(f->ip);
+     end_op();
+   }
++  bd_free(f);
+ }
+ 
+ // Get metadata about file f.
+diff --git a/kernel/file.h b/kernel/file.h
+index f696f64..c253c3b 100644
+--- a/kernel/file.h
++++ b/kernel/file.h
+@@ -1,3 +1,8 @@
++#ifndef SPINLOCK_GUARD
++#include "spinlock.h"
++#define SPINLOCK_GUARD
++#endif
++
+ struct file {
+   enum { FD_NONE, FD_PIPE, FD_INODE, FD_DEVICE } type;
+   int ref;  // reference count
+@@ -7,6 +12,7 @@ struct file {
+   struct inode *ip;   // FD_INODE and FD_DEVICE
+   uint off;           // FD_INODE
+   short major;        // FD_DEVICE
++  struct spinlock lock;
+ };
+ 
+ #define major(dev) ((dev) >> 16 & 0xFFFF)
+diff --git a/kernel/spinlock.h b/kernel/spinlock.h
+index 597acb0..c45eef8 100644
+--- a/kernel/spinlock.h
++++ b/kernel/spinlock.h
+@@ -6,3 +6,5 @@ struct spinlock {
+   char *name;       // Name of lock.
+   struct cpu *cpu;  // The cpu holding the lock.
+ };
++
++#define SPINLOCK_GUARD
